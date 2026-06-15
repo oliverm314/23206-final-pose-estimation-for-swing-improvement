@@ -49,8 +49,42 @@ class MediaPipe_PoseEstimation:
 
     # Processes the input video, calculates pose statistics, and generates an output video and write the statistics into .csv file
     def process_video(self):
-        mp_drawing = mp.solutions.drawing_utils
-        mp_pose = mp.solutions.pose
+        # Support both older `mp.solutions` API and the newer Tasks API.
+        use_solutions = hasattr(mp, 'solutions')
+
+        if use_solutions:
+            mp_drawing = mp.solutions.drawing_utils
+            mp_pose = mp.solutions.pose
+        else:
+            try:
+                from mediapipe.tasks.python import vision as mp_tasks_vision
+                from mediapipe.tasks.python.vision.core import image as mp_image
+            except Exception:
+                raise ImportError(
+                    "Mediapipe is installed but neither `mp.solutions` nor the Tasks Vision API are available.\n"
+                    "Install a compatible mediapipe (e.g. `pip install mediapipe==0.10.8`) or ensure the Tasks API is present."
+                )
+
+            # model path must be provided via env var when using the Tasks API
+            model_path = (
+                None
+            )
+            import os
+
+            model_path = os.environ.get('MEDIAPIPE_POSE_LANDMARKER_MODEL')
+            if not model_path:
+                raise RuntimeError(
+                    "Mediapipe on this system uses the Tasks API (no mp.solutions).\n"
+                    "Please either: \n"
+                    "  - set the environment variable MEDIAPIPE_POSE_LANDMARKER_MODEL to a local pose_landmarker model file path, or\n"
+                    "  - install the legacy API with: pip install mediapipe==0.10.8\n"
+                    "See https://developers.google.com/mediapipe for model downloads and usage."
+                )
+
+            mp_tasks = mp_tasks_vision
+            mp_image_lib = mp_image
+            # create landmarker (image mode)
+            landmarker = mp_tasks.PoseLandmarker.create_from_model_path(model_path)
 
         with open(self.csv_file_name, mode='w', newline='') as file:
             writer = csv.writer(file)
@@ -75,22 +109,29 @@ class MediaPipe_PoseEstimation:
         out = cv2.VideoWriter(self.output_video_name, fourcc, 30.0, (int(cap.get(3)), int(cap.get(4))))
 
         frame_number = 0
-        with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-            while cap.isOpened():
-                success, image = cap.read()
-                if not success:
-                  print("Null.Frames")
-                  break
-                try:
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    video_timestamp = round(frame_number / fps)
-                    video_timestamp = str(datetime.timedelta(seconds=video_timestamp))
-                    h, w = image.shape[:2]
+        if use_solutions:
+            pose_ctx = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        else:
+            pose_ctx = landmarker
 
+        # process frames
+        while cap.isOpened():
+            success, image = cap.read()
+            if not success:
+                print("Null.Frames")
+                break
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                video_timestamp = round(frame_number / fps)
+                video_timestamp = str(datetime.timedelta(seconds=video_timestamp))
+                h, w = image.shape[:2]
+
+                # prepare image for the chosen API
+                if use_solutions:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     image.flags.writeable = False
 
-                    keypoints = pose.process(image)
+                    keypoints = pose_ctx.process(image)
 
                     image.flags.writeable = True
                     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -109,86 +150,114 @@ class MediaPipe_PoseEstimation:
                     right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
                     left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
                     left_elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW]
+                else:
+                    # Tasks API: create Image wrapper and run detection (image mode)
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    # ensure uint8
+                    if image_rgb.dtype != 'uint8':
+                        image_rgb = image_rgb.astype('uint8')
+                    mp_image_obj = mp_image_lib.Image(mp_image_lib.ImageFormat.SRGB, image_rgb)
+                    result = pose_ctx.detect(mp_image_obj)
+                    if not result.pose_landmarks:
+                        # no detection for this frame; skip writing landmarks, but still write frame
+                        frame_number += 1
+                        out.write(image)
+                        continue
 
-                    knee_angle = self.calculate_angle(left_hip, left_knee, left_ankle)
-                    pelvis_angle = self.calculate_angle(left_ankle, left_hip, right_shoulder)
-                    arm_angle = self.calculate_angle(left_wrist, left_elbow, left_shoulder)
-                    shoulders_inclination = self.calculate_angle2(int(right_shoulder.x * w), int(right_shoulder.y * h),
-                                                                  int(left_shoulder.x * w), int(left_shoulder.y * h),
-                                                                  'x', 'left')
-                    hips_inclination = self.calculate_angle2(int(left_hip.x * w), int(left_hip.y * h),
-                                                              int(right_hip.x * w), int(right_hip.y * h), 'x')
+                    landmarks = result.pose_landmarks[0]
 
-                    midpoint_x, midpoint_y = self.middle_point(right_ankle, left_ankle)
+                    left_shoulder = landmarks[mp_tasks.PoseLandmark.LEFT_SHOULDER]
+                    right_shoulder = landmarks[mp_tasks.PoseLandmark.RIGHT_SHOULDER]
+                    left_hip = landmarks[mp_tasks.PoseLandmark.LEFT_HIP]
+                    right_hip = landmarks[mp_tasks.PoseLandmark.RIGHT_HIP]
+                    right_wrist = landmarks[mp_tasks.PoseLandmark.RIGHT_WRIST]
+                    left_wrist = landmarks[mp_tasks.PoseLandmark.LEFT_WRIST]
+                    nose = landmarks[mp_tasks.PoseLandmark.NOSE]
+                    right_knee = landmarks[mp_tasks.PoseLandmark.RIGHT_KNEE]
+                    left_knee = landmarks[mp_tasks.PoseLandmark.LEFT_KNEE]
+                    right_ankle = landmarks[mp_tasks.PoseLandmark.RIGHT_ANKLE]
+                    left_ankle = landmarks[mp_tasks.PoseLandmark.LEFT_ANKLE]
+                    left_elbow = landmarks[mp_tasks.PoseLandmark.LEFT_ELBOW]
 
-                    with open(self.csv_file_name, mode='a', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow([video_timestamp, shoulders_inclination, hips_inclination,
-                                         knee_angle, pelvis_angle, arm_angle,
-                                         int(right_shoulder.x * w), int(right_shoulder.y * h),
-                                         int(left_shoulder.x * w), int(left_shoulder.y * h),
-                                         int(left_elbow.x * w), int(left_elbow.y * h),
-                                         int(right_wrist.x * w), int(right_wrist.y * h),
-                                         int(left_wrist.x * w), int(left_wrist.y * h),
-                                         int(nose.x * w), int(nose.y * h),
-                                         int(right_hip.x * w), int(right_hip.y * h),
-                                         int(left_hip.x * w), int(left_hip.y * h),
-                                         int(right_knee.x * w), int(right_knee.y * h),
-                                         int(left_knee.x * w), int(left_knee.y * h),
-                                         int(right_ankle.x * w), int(right_ankle.y * h),
-                                         int(left_ankle.x * w), int(left_ankle.y * h),
-                                         int(midpoint_x * w), int(midpoint_y * h)])
+                knee_angle = self.calculate_angle(left_hip, left_knee, left_ankle)
+                pelvis_angle = self.calculate_angle(left_ankle, left_hip, right_shoulder)
+                arm_angle = self.calculate_angle(left_wrist, left_elbow, left_shoulder)
+                shoulders_inclination = self.calculate_angle2(int(right_shoulder.x * w), int(right_shoulder.y * h),
+                                                              int(left_shoulder.x * w), int(left_shoulder.y * h),
+                                                              'x', 'left')
+                hips_inclination = self.calculate_angle2(int(left_hip.x * w), int(left_hip.y * h),
+                                                          int(right_hip.x * w), int(right_hip.y * h), 'x')
 
-                    # Display points
-                    cv2.circle(image, (int(right_shoulder.x * w), int(right_shoulder.y * h)), 6, (0, 255, 0), -1)
-                    cv2.circle(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)), 6, (0, 255, 0), -1)
-                    cv2.circle(image, (int(right_hip.x * w), int(right_hip.y * h)), 6, (255, 255, 0), -1)
-                    cv2.circle(image, (int(left_hip.x * w), int(left_hip.y * h)), 6, (0, 150, 255), -1)
-                    cv2.circle(image, (int(right_knee.x * w), int(right_knee.y * h)), 6, (255, 0, 255), -1)
-                    cv2.circle(image, (int(left_knee.x * w), int(left_knee.y * h)), 6, (255, 0, 255), -1)
-                    cv2.circle(image, (int(left_ankle.x * w), int(left_ankle.y * h)), 6, (255, 0, 0), -1)
-                    cv2.circle(image, (int(left_wrist.x * w), int(left_wrist.y * h)), 6, (0, 255, 255), -1)
-                    cv2.circle(image, (int(nose.x * w), int(nose.y * h)), 6, (0, 0, 255), -1)
-                    cv2.circle(image, (int(left_elbow.x * w), int(left_elbow.y * h)), 6, (128, 0, 128), -1)
-                    cv2.circle(image, (int(right_ankle.x * w), int(right_ankle.y * h)), 6, (255, 0, 0), -1)
-                    cv2.circle(image, (int(midpoint_x * w), int(midpoint_y * h)), 6, (255, 255, 255), -1)
+                midpoint_x, midpoint_y = self.middle_point(right_ankle, left_ankle)
 
-                    # Display angle and lines on the image
-                    cv2.putText(image, f'Shoulders inclination: {shoulders_inclination:.2f}', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.line(image, (int(right_shoulder.x * w), int(right_shoulder.y * h)), (int(right_shoulder.x * w) + 100, int(right_shoulder.y * h)), (0, 255, 0), 2)
-                    cv2.line(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)), (int(right_shoulder.x * w), int(right_shoulder.y * h)), (0, 255, 0), 2)
+                with open(self.csv_file_name, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([video_timestamp, shoulders_inclination, hips_inclination,
+                                     knee_angle, pelvis_angle, arm_angle,
+                                     int(right_shoulder.x * w), int(right_shoulder.y * h),
+                                     int(left_shoulder.x * w), int(left_shoulder.y * h),
+                                     int(left_elbow.x * w), int(left_elbow.y * h),
+                                     int(right_wrist.x * w), int(right_wrist.y * h),
+                                     int(left_wrist.x * w), int(left_wrist.y * h),
+                                     int(nose.x * w), int(nose.y * h),
+                                     int(right_hip.x * w), int(right_hip.y * h),
+                                     int(left_hip.x * w), int(left_hip.y * h),
+                                     int(right_knee.x * w), int(right_knee.y * h),
+                                     int(left_knee.x * w), int(left_knee.y * h),
+                                     int(right_ankle.x * w), int(right_ankle.y * h),
+                                     int(left_ankle.x * w), int(left_ankle.y * h),
+                                     int(midpoint_x * w), int(midpoint_y * h)])
 
-                    cv2.putText(image, f'Hips inclination: {hips_inclination:.2f}', (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(left_hip.x * w) - 100, int(left_hip.y * h)), (255, 255, 0), 2)
-                    cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(right_hip.x * w), int(right_hip.y * h)), (255, 255, 0), 2)
+                # Display points
+                cv2.circle(image, (int(right_shoulder.x * w), int(right_shoulder.y * h)), 6, (0, 255, 0), -1)
+                cv2.circle(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)), 6, (0, 255, 0), -1)
+                cv2.circle(image, (int(right_hip.x * w), int(right_hip.y * h)), 6, (255, 255, 0), -1)
+                cv2.circle(image, (int(left_hip.x * w), int(left_hip.y * h)), 6, (0, 150, 255), -1)
+                cv2.circle(image, (int(right_knee.x * w), int(right_knee.y * h)), 6, (255, 0, 255), -1)
+                cv2.circle(image, (int(left_knee.x * w), int(left_knee.y * h)), 6, (255, 0, 255), -1)
+                cv2.circle(image, (int(left_ankle.x * w), int(left_ankle.y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(image, (int(left_wrist.x * w), int(left_wrist.y * h)), 6, (0, 255, 255), -1)
+                cv2.circle(image, (int(nose.x * w), int(nose.y * h)), 6, (0, 0, 255), -1)
+                cv2.circle(image, (int(left_elbow.x * w), int(left_elbow.y * h)), 6, (128, 0, 128), -1)
+                cv2.circle(image, (int(right_ankle.x * w), int(right_ankle.y * h)), 6, (255, 0, 0), -1)
+                cv2.circle(image, (int(midpoint_x * w), int(midpoint_y * h)), 6, (255, 255, 255), -1)
 
-                    cv2.putText(image, f'Knee Angle: {knee_angle:.2f}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-                    cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(left_knee.x * w), int(left_knee.y * h)), (255, 0, 255), 2)
-                    cv2.line(image, (int(left_knee.x * w), int(left_knee.y * h)), (int(left_ankle.x * w), int(left_ankle.y * h)), (255, 0, 255), 2)
+                # Display angle and lines on the image
+                cv2.putText(image, f'Shoulders inclination: {shoulders_inclination:.2f}', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.line(image, (int(right_shoulder.x * w), int(right_shoulder.y * h)), (int(right_shoulder.x * w) + 100, int(right_shoulder.y * h)), (0, 255, 0), 2)
+                cv2.line(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)), (int(right_shoulder.x * w), int(right_shoulder.y * h)), (0, 255, 0), 2)
 
-                    cv2.putText(image, f'Pelvis Angle: {pelvis_angle:.2f}', (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 150, 255), 2)
-                    cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(left_ankle.x * w), int(left_ankle.y * h)), (0, 150, 255), 2)
-                    cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(right_shoulder.x * w), int(right_shoulder.y * h)), (0, 150, 255), 2)
+                cv2.putText(image, f'Hips inclination: {hips_inclination:.2f}', (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(left_hip.x * w) - 100, int(left_hip.y * h)), (255, 255, 0), 2)
+                cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(right_hip.x * w), int(right_hip.y * h)), (255, 255, 0), 2)
 
-                    cv2.putText(image, f'Arm Angle: {arm_angle:.2f}', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 0, 128), 2)
-                    cv2.line(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)), (int(left_elbow.x * w), int(left_elbow.y * h)), (128, 0, 128), 2)
-                    cv2.line(image, (int(left_elbow.x * w), int(left_elbow.y * h)), (int(left_wrist.x * w), int(left_wrist.y * h)), (128, 0, 128), 2)
+                cv2.putText(image, f'Knee Angle: {knee_angle:.2f}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(left_knee.x * w), int(left_knee.y * h)), (255, 0, 255), 2)
+                cv2.line(image, (int(left_knee.x * w), int(left_knee.y * h)), (int(left_ankle.x * w), int(left_ankle.y * h)), (255, 0, 255), 2)
 
-                    cv2.line(image, (int(left_ankle.x * w), int(left_ankle.y * h)), (int(left_ankle.x * w), int(left_ankle.y * h) - 200), (255, 0, 0), 2)
-                    cv2.line(image, (int(right_ankle.x * w), int(right_ankle.y * h)), (int(right_ankle.x * w), int(right_ankle.y * h) - 200), (255, 0, 0), 2)
+                cv2.putText(image, f'Pelvis Angle: {pelvis_angle:.2f}', (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 150, 255), 2)
+                cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(left_ankle.x * w), int(left_ankle.y * h)), (0, 150, 255), 2)
+                cv2.line(image, (int(left_hip.x * w), int(left_hip.y * h)), (int(right_shoulder.x * w), int(right_shoulder.y * h)), (0, 150, 255), 2)
 
-                    cv2.line(image, (int(midpoint_x * w), int(midpoint_y * h)), (int(midpoint_x * w), int(midpoint_y * h) - 200), (255, 255, 255), 2)
+                cv2.putText(image, f'Arm Angle: {arm_angle:.2f}', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 0, 128), 2)
+                cv2.line(image, (int(left_shoulder.x * w), int(left_shoulder.y * h)), (int(left_elbow.x * w), int(left_elbow.y * h)), (128, 0, 128), 2)
+                cv2.line(image, (int(left_elbow.x * w), int(left_elbow.y * h)), (int(left_wrist.x * w), int(left_wrist.y * h)), (128, 0, 128), 2)
 
-                    # Write the frame into the file
-                    out.write(image)
+                cv2.line(image, (int(left_ankle.x * w), int(left_ankle.y * h)), (int(left_ankle.x * w), int(left_ankle.y * h) - 200), (255, 0, 0), 2)
+                cv2.line(image, (int(right_ankle.x * w), int(right_ankle.y * h)), (int(right_ankle.x * w), int(right_ankle.y * h) - 200), (255, 0, 0), 2)
 
-                    if cv2.waitKey(5) & 0xFF == 27:  # Press 'Esc' to exit the video window
-                        break
+                cv2.line(image, (int(midpoint_x * w), int(midpoint_y * h)), (int(midpoint_x * w), int(midpoint_y * h) - 200), (255, 255, 255), 2)
 
-                    frame_number += 1
+                # Write the frame into the file
+                out.write(image)
 
-                except Exception as e:
-                    print(f"An error occurred: {e}")
+                if cv2.waitKey(5) & 0xFF == 27:  # Press 'Esc' to exit the video window
+                    break
+
+                frame_number += 1
+
+            except Exception as e:
+                print(f"An error occurred: {e}")
 
         # Release the video capture and writer objects
         cap.release()
