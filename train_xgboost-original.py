@@ -57,9 +57,7 @@ USE_CACHE = True
 CLUB_WEIGHTS = "best (1).pt"
 CLUB_CACHE_DIR = "club_cache"
 USE_CLUB = True
-CLUB_IMGSZ = 640          # 640 recovers clubhead detection on wide/low-res amateur
-#                           clips (worst went 0.00->0.66); 320 was ~3x faster but
-#                           dropped the club on exactly the clips that needed it
+CLUB_IMGSZ = 320          # 320 matches 640 detection on these clips, ~3x faster
 CLUB_CONF = 0.25          # detection confidence threshold
 
 # Handedness of the golfers. Lead wrist = left wrist for a right-handed golfer.
@@ -899,15 +897,12 @@ def build_dataset(dataset_dir: str = DATASET_DIR) -> pd.DataFrame:
     if len(df) < before:
         print(f"[info] dropped {before - len(df)} video(s) with no usable pose")
 
-    # Per-feature NaNs (e.g. club not detected -> no clubhead_above_plane) are
-    # left as NaN ON PURPOSE: XGBoost learns a default split direction for
-    # missing values, which beats median-imputation here because missingness is
-    # informative (club detection fails ~non-randomly). Median-imputing instead
-    # fakes a non-OTT value into half the OTT clips and dropped CV-AUC ~0.013.
+    # Impute any remaining per-feature NaNs with that feature's median
     for col in feature_cols:
-        n_missing = int(df[col].isna().sum())
-        if n_missing:
-            print(f"[info] '{col}': {n_missing} NaN left for XGBoost to handle")
+        if df[col].isna().any():
+            med = df[col].median()
+            df[col] = df[col].fillna(med)
+            print(f"[info] imputed NaNs in '{col}' with median={med:.4f}")
 
     return df
 
@@ -924,7 +919,6 @@ def _make_model() -> xgb.XGBClassifier:
         subsample=0.9,
         colsample_bytree=1.0,
         eval_metric="logloss",
-        missing=np.nan,            # learn a default direction for missing feats
         random_state=RANDOM_STATE,
     )
 
@@ -1082,6 +1076,7 @@ def make_plots(df: pd.DataFrame, model, eval_bundle, out_prefix="ott"):
 
 
 def print_example_predictions(df, model, eval_bundle, n=8):
+    feature_cols = list(FEATURE_REGISTRY.keys())
     _, y_test, y_proba, idx_test = eval_bundle
 
     print("\n---------------- Example predictions ----------------")

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env (5.5 GB — never commit)
+.venv/
+venv/
+env/
+
+# Large / regenerable data — kept local, not in git
+dataset/            # ~337 MB of source videos
+pose_cache/         # MediaPipe landmark cache (regenerate from videos)
+club_cache/         # YOLO club-track cache (regenerate from videos)
+
+# Video files anywhere
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# OS cruft
+Thumbs.db
+.DS_Store
+
+# NOTE: kept in git on purpose -> best (1).pt (YOLO weights, 49 MB),
+# golf_pose_bundle.npz, *.csv, *.png figures, *.ipynb, *.py
